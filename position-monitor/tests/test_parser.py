@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Тесты парсера выдачи FunPay для плагина «Монитор позиций».
 
-Прогон по реальной фикстуре: /home/user/funpay-factory/fixtures/lots_1392_rows.html
+Прогон по реальной фикстуре: fixtures/lots_1392_rows.html (путь от корня репозитория)
 (снимок страницы funpay.com/lots/1392/ от 10.10.2026, 40 строк).
 
 Запуск: python3 -m pytest tests/ -q   (нужны beautifulsoup4 и pytest).
