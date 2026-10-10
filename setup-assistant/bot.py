@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -147,7 +148,10 @@ def final_keyboard() -> InlineKeyboardMarkup:
 
 
 def _support_username() -> str:
-    return os.getenv(SUPPORT_USERNAME_ENV, "").strip().lstrip("@")
+    name = os.getenv(SUPPORT_USERNAME_ENV, "").strip().lstrip("@")
+    # Значение из .env вставляется в HTML-экраны: пропускаем только ник-подобное,
+    # чтобы опечатка с & или < не ломала рендер (и не тащила произвольный HTML).
+    return name if re.fullmatch(r"[A-Za-z0-9_]{5,32}", name) else ""
 
 
 def _render_greeting() -> str:
@@ -271,7 +275,9 @@ def create_router() -> Router:
     """
     router = Router()
 
-    @router.message(CommandStart())
+    # Бот - личный ассистент покупателя: в группах и каналах не отвечаем,
+    # иначе любой чат, куда его добавят, превращается в спам-усилитель.
+    @router.message(CommandStart(), F.chat.type == "private")
     async def cmd_start(message: Message, state: FSMContext) -> None:
         logger.info(
             "Пользователь начал прохождение: user_id=%s",
@@ -281,7 +287,7 @@ def create_router() -> Router:
         await state.set_state(Flow.choosing_os)
         await message.answer(_render_greeting(), reply_markup=os_keyboard())
 
-    @router.message()
+    @router.message(F.chat.type == "private")
     async def fallback_text(message: Message, state: FSMContext) -> None:
         current = await state.get_state()
         # Пользователь ещё не начинал (state=None) или выбирает ОС - зовём на кнопки выбора.
@@ -446,6 +452,8 @@ class ThrottlingMiddleware(BaseMiddleware):
         self._limit = limit
         self._window = window
         self._hits: dict[int, deque[float]] = defaultdict(deque)
+        self._last_warn: dict[int, float] = {}
+        self._last_cleanup = 0.0
 
     @staticmethod
     def _extract_user_id(event: Update) -> int | None:
@@ -465,7 +473,9 @@ class ThrottlingMiddleware(BaseMiddleware):
     ) -> Any:
         user_id = self._extract_user_id(event)
         if user_id is None:
-            return await handler(event, data)
+            # Анонимные события (посты каналов, from_user=None) - молча игнорируем:
+            # троттлинг к ним неприменим, и отвечать на них бот не должен.
+            return None
         now = time.monotonic()
         hits = self._hits[user_id]
         while hits and now - hits[0] > self._window:
@@ -473,21 +483,28 @@ class ThrottlingMiddleware(BaseMiddleware):
         if len(hits) >= self._limit:
             logger.info("Анти-флуд: user_id=%s, апдейт отброшен", user_id)
             if event.callback_query:
-                try:
-                    await event.callback_query.answer(steps.THROTTLE_TEXT)
-                except Exception:  # noqa: BLE001 - не роняем цикл из-за тоста
-                    pass
+                # Тост с текстом шлём максимум раз в секунду на пользователя:
+                # отвечать на КАЖДЫЙ спам-коллбэк - самому стать источником флуда
+                # и выедать общую квоту бота.
+                if now - self._last_warn.get(user_id, 0.0) >= 1.0:
+                    self._last_warn[user_id] = now
+                    try:
+                        await event.callback_query.answer(steps.THROTTLE_TEXT)
+                    except Exception:  # noqa: BLE001 - не роняем цикл из-за тоста
+                        pass
             return None
         hits.append(now)
-        if len(self._hits) > 10_000:
-            # Мягкая защита от роста словаря на очень долгом аптайме:
-            # вычищаем пустые деки и тех, кто молчит дольше окна анти-флуда.
+        if len(self._hits) > 10_000 and now - self._last_cleanup >= self._window:
+            # Мягкая защита от роста словаря на очень долгом аптайме. Скан O(n)
+            # запускаем не чаще раза за окно анти-флуда, а не на каждом апдейте.
+            self._last_cleanup = now
             for stale_id in [
                 uid
                 for uid, h in self._hits.items()
                 if not h or now - h[-1] > self._window
             ]:
                 self._hits.pop(stale_id, None)
+                self._last_warn.pop(stale_id, None)
         return await handler(event, data)
 
 

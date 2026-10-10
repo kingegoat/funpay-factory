@@ -1,0 +1,8 @@
+# Не отправлять в build-контекст демону Docker:
+# .env с живым токеном, тяжёлые и служебные каталоги.
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+deploy/

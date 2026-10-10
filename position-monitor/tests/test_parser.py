@@ -53,7 +53,7 @@ def test_first_row_is_promo() -> None:
     assert first.offer_id == 70000001
     assert first.promo is True          # класс offer-promo offer-promoted
     assert first.position_organic is None
-    assert first.seller == "levetro"
+    assert first.seller == "seller11"
     assert first.reviews == 1938
     assert first.price == 10.54107      # сравнение по data-s
     assert first.currency == "₽"
@@ -67,7 +67,7 @@ def test_known_lot_rayproject() -> None:
     assert row is not None
     assert row.position == 2
     assert row.position_organic == 1   # первый среди строк без закрепа
-    assert row.seller == "RAYPROJECT"
+    assert row.seller == "seller9"
     assert row.reviews == 4217
     assert row.price == 26.435845
     assert row.auto is True

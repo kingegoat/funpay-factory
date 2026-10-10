@@ -296,14 +296,30 @@ def test_cooldown_skips_second_message(plugin) -> None:
 
 
 def test_different_chats_not_blocked_by_cooldown(plugin) -> None:
-    """Кулдаун индивидуален для каждого чата."""
+    """Кулдаун индивидуален для каждого чата (глобальный кулдаун отключаем)."""
     server = _make_server(_OkHandler)
     try:
-        _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
+        cfg = _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
+        cfg["global_cooldown"] = 0
         cardinal = FakeCardinal()
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=1)))
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=2)))
         assert len(cardinal.sent) == 2
+    finally:
+        server.shutdown()
+
+
+def test_global_cooldown_limits_cross_chat_flood(plugin) -> None:
+    """Всплеск из разных чатов упирается в глобальный кулдаун LLM."""
+    server = _make_server(_OkHandler)
+    try:
+        cfg = _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
+        cfg["global_cooldown"] = 3600
+        cardinal = FakeCardinal()
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=1)))
+        # Сообщение из другого чата в ту же секунду - LLM-запрос не нужен.
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=2)))
+        assert len(cardinal.sent) == 1
     finally:
         server.shutdown()
 

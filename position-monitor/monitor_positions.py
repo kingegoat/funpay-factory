@@ -42,7 +42,7 @@ NAME: str = "Монитор позиций"
 VERSION: str = "1.0.0"
 DESCRIPTION: str = ("Следит за позициями лотов в выдаче FunPay: алерты о падении, "
                     "демпинге и исчезновении лота, утренняя сводка, команда /positions.")
-CREDITS: str = "Игорь, Cardinal-фабрика"
+CREDITS: str = "funpay-factory"
 SETTINGS_PAGE: bool = False
 UUID: str = "05026a8e-292a-46f3-b5b8-e485a87768b1"
 BIND_TO_DELETE: Callable[..., Any] | None = None  # одиночный callable, заполняется ниже
@@ -275,7 +275,8 @@ def fmt_price(price: float | None, currency: str) -> str:
     """Форматирует цену: '26.44 ₽'."""
     if price is None:
         return "?"
-    suffix = f" {currency}" if currency else ""
+    # currency приходит из чужой строки выдачи - экранируем как весь остальной текст
+    suffix = f" {esc(currency)}" if currency else ""
     return f"{price:.2f}{suffix}"
 
 
@@ -351,25 +352,26 @@ def rows_from_api_lots(lots: Iterable[Any]) -> list[OfferRow]:
 
 def _fetch_node_html(cardinal: Any, node_id: int) -> str:
     """Загружает HTML страницы выдачи через сессию аккаунта FunPay."""
-    timeout = int(CONFIG.get("request_timeout", 30))
+    timeout = max(int(float(CONFIG.get("request_timeout") or 30)), 1)
     response = None
-    # Основной путь: тот же метод, которым пользуется сам FunPayAPI
-    # (подставляет cookies аккаунта, user-agent и прокси).
-    account_method = getattr(cardinal.account, "method", None)
-    if callable(account_method):
-        response = account_method("get", f"lots/{int(node_id)}/",
-                                  {"accept": "*/*"}, {}, raise_not_200=True)
+    # Основной путь: сессия аккаунта (cookies, user-agent, прокси) с явным
+    # timeout - account.method() таймаут не передаёт, зависший сокет убил бы
+    # поток мониторинга навсегда.
+    session = getattr(cardinal.account, "session", None)
+    if session is not None:
+        response = session.get(_FUNPAY_NODE_URL.format(node_id=int(node_id)),
+                               headers={"accept": "*/*"}, timeout=timeout)
     else:
-        session = getattr(cardinal.account, "session", None)
-        if session is not None:
-            response = session.get(_FUNPAY_NODE_URL.format(node_id=int(node_id)),
-                                   timeout=timeout)
-        else:
-            import requests
+        import requests
 
-            response = requests.get(_FUNPAY_NODE_URL.format(node_id=int(node_id)),
-                                    timeout=timeout)
-        response.raise_for_status()
+        response = requests.get(_FUNPAY_NODE_URL.format(node_id=int(node_id)),
+                                headers={"User-Agent": "Mozilla/5.0",
+                                         "accept": "*/*"},
+                                timeout=timeout)
+    response.raise_for_status()
+    if len(response.content) > 2_000_000:
+        raise RuntimeError(f"ответ раздела {node_id} подозрительно большой "
+                           f"({len(response.content)} байт)")
     if not response.encoding:
         response.encoding = "utf-8"
     return response.text
@@ -487,7 +489,8 @@ def _reply_tg(cardinal: Any, message: Any, text: str) -> None:
         _send_tg(cardinal, text)
         return
     try:
-        tg.bot.send_message(chat_id, text, disable_web_page_preview=True)
+        tg.bot.send_message(chat_id, text, disable_web_page_preview=True,
+                            parse_mode="HTML")
     except Exception:  # pylint: disable=broad-except
         logger.error("Не удалось ответить в чат %s", chat_id)
         logger.debug("TRACEBACK", exc_info=True)
@@ -517,8 +520,8 @@ def _process_lot(cardinal: Any, lot_cfg: dict[str, Any], rows: Sequence[OfferRow
     """
     lot_id = lot_cfg["lot_id"]
     name = lot_cfg["name"]
-    threshold = int(CONFIG.get("drop_threshold", 5))
-    limit = int(CONFIG.get("competitors_in_report", 3))
+    threshold = max(int(float(CONFIG.get("drop_threshold", 5) or 5)), 1)
+    limit = max(int(float(CONFIG.get("competitors_in_report", 3) or 3)), 0)
     cooldown_sec = _cooldown_seconds()
     row = find_offer(rows, lot_id)
     alerts: list[str] = []
@@ -648,7 +651,7 @@ def _run_check_cycle(cardinal: Any, failures: dict[int, int]) -> None:
     for lot in _configured_lots():
         by_node.setdefault(lot["node_id"], []).append(lot)
 
-    notify_after = int(CONFIG.get("fetch_fail_notify_after", 3))
+    notify_after = max(int(float(CONFIG.get("fetch_fail_notify_after", 3) or 3)), 0)
     for node_id, lots in by_node.items():
         try:
             rows, source = fetch_node_rows(cardinal, node_id)
@@ -706,7 +709,12 @@ def _monitor_loop(cardinal: Any) -> None:
         except Exception:  # pylint: disable=broad-except
             logger.error("Не удалось отправить утреннюю сводку")
             logger.debug("TRACEBACK", exc_info=True)
-        _STOP.wait(_interval_seconds())
+        # Backoff: если раздел стабильно падает (403/429 FunPay, сеть),
+        # увеличиваем паузу до x16, чтобы не долбить сессию аккаунта тем же темпом.
+        delay = _interval_seconds()
+        if failures:
+            delay *= 2 ** min(max(failures.values()), 4)
+        _STOP.wait(delay)
     logger.info("Монитор позиций остановлен")
 
 
@@ -721,7 +729,7 @@ def build_positions_report(cardinal: Any) -> str:
     header = f"📍 <b>Позиции</b> ({time.strftime('%d.%m.%Y %H:%M')})"
     if not lots:
         return header + "\nВ конфиге плагина не задано ни одного лота."
-    limit = int(CONFIG.get("competitors_in_report", 3))
+    limit = max(int(float(CONFIG.get("competitors_in_report", 3) or 3)), 0)
     lines = [header]
     by_node: dict[int, list[dict[str, Any]]] = {}
     for lot in lots:
@@ -749,6 +757,15 @@ def build_positions_report(cardinal: Any) -> str:
     return "\n".join(lines)
 
 
+def _authorized_message(message: Any) -> bool:
+    """Команды плагина - только владельцу бота (authorized_users Cardinal)."""
+    cardinal = _CARDINAL
+    allowed = set(getattr(getattr(cardinal, "telegram", None),
+                          "authorized_users", {}) or {})
+    user = getattr(message, "from_user", None)
+    return user is not None and user.id in allowed
+
+
 def _cmd_positions(message: Any) -> None:
     """Обработчик команды /positions: отвечает сразу, отчёт собирает в фоне.
 
@@ -756,7 +773,7 @@ def _cmd_positions(message: Any) -> None:
     /positions не затормозят остальные команды TG-бота.
     """
     cardinal = _CARDINAL
-    if cardinal is None:
+    if cardinal is None or not _authorized_message(message):
         return
     _reply_tg(cardinal, message, "Собираю отчёт по позициям...")
 
@@ -792,7 +809,7 @@ HELP_TEXT = (
 
 def _cmd_help(message: Any) -> None:
     """Обработчик команды /pm_help."""
-    if _CARDINAL is None:
+    if _CARDINAL is None or not _authorized_message(message):
         return
     _reply_tg(_CARDINAL, message, HELP_TEXT)
 

@@ -12,5 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py steps.py ./
 
+# Бот - вечный сетевой процесс: в контейнере работаем не от root.
+RUN useradd -r -u 10001 bot
+USER bot
+
 # Токен и настройки передаются через переменные окружения (env_file в compose).
 CMD ["python", "bot.py"]

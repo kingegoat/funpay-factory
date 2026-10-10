@@ -4,6 +4,7 @@
 #   sudo mkdir -p /opt/setup-assistant
 #   sudo cp bot.py steps.py requirements.txt /opt/setup-assistant/
 #   sudo cp .env /opt/setup-assistant/.env
+#   sudo chown setupbot:setupbot /opt/setup-assistant/.env && sudo chmod 600 /opt/setup-assistant/.env
 #   cd /opt/setup-assistant && sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt
 #   sudo cp deploy/setup-assistant.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
@@ -25,6 +26,14 @@ EnvironmentFile=/opt/setup-assistant/.env
 ExecStart=/opt/setup-assistant/.venv/bin/python /opt/setup-assistant/bot.py
 Restart=on-failure
 RestartSec=5
+
+# Изоляция: бот только ходит в Telegram наружу и читает свои файлы.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
