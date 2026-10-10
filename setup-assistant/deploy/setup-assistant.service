@@ -1,0 +1,30 @@
+# systemd-юнит бота «Настройка Cardinal с ассистентом».
+#
+# Установка на сервере (пример, пути подставьте свои):
+#   sudo mkdir -p /opt/setup-assistant
+#   sudo cp bot.py steps.py requirements.txt /opt/setup-assistant/
+#   sudo cp .env /opt/setup-assistant/.env
+#   cd /opt/setup-assistant && sudo python3 -m venv .venv && sudo .venv/bin/pip install -r requirements.txt
+#   sudo cp deploy/setup-assistant.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now setup-assistant
+#   journalctl -u setup-assistant -f   # смотреть логи
+
+[Unit]
+Description=FunPay Cardinal Setup Assistant (Telegram bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Пользователь, от которого работает бот (создайте: sudo useradd -r -s /usr/sbin/nologin setupbot).
+User=setupbot
+Group=setupbot
+WorkingDirectory=/opt/setup-assistant
+EnvironmentFile=/opt/setup-assistant/.env
+ExecStart=/opt/setup-assistant/.venv/bin/python /opt/setup-assistant/bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

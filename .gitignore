@@ -1,0 +1,12 @@
+# Платные продукты: продаются лотами на FunPay, в открытый репозиторий не входят
+texts/
+guide/
+
+# Секреты
+.env
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
