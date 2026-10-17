@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Тесты парсера выдачи FunPay для плагина «Монитор позиций».
 
-Прогон по реальной фикстуре: fixtures/lots_1392_rows.html (путь от корня репозитория)
-(снимок страницы funpay.com/lots/1392/ от 10.10.2026, 40 строк).
+Прогон по синтетической фикстуре: fixtures/lots_1392_rows.html (путь от корня
+репозитория). Фикстура повторяет структуру страницы funpay.com/lots/1392/
+(40 строк, закрепы, дубль закреплённого лота, lazyload-блок), но все offer id,
+id продавцов, аватары и названия лотов - выдуманные (fixtures/make_fixture.py).
 
 Запуск: python3 -m pytest tests/ -q   (нужны beautifulsoup4 и pytest).
 """
@@ -62,7 +64,7 @@ def test_first_row_is_promo() -> None:
     assert "СИНТЕТИЧЕСКИЙ ЛОТ" in first.title
 
 
-def test_known_lot_rayproject() -> None:
+def test_known_lot() -> None:
     row = mp.find_offer(_rows(), 32500001)
     assert row is not None
     assert row.position == 2
@@ -88,11 +90,38 @@ def test_all_prices_parsed_from_data_s() -> None:
         assert isinstance(row.price, float)
 
 
-def test_duplicate_offer_returns_first_position() -> None:
+def test_duplicate_promo_offer_returns_first() -> None:
     rows = _rows()
     positions = [r.position for r in rows if r.offer_id == 70000001]
     assert positions == [1, 36]        # лот в закрепе дублируется в выдаче
+    # оба вхождения - закрепы: берём первый (органической копии нет)
     assert mp.find_offer(rows, 70000001).position == 1
+
+
+def test_find_offer_prefers_organic_copy() -> None:
+    """Если у лота есть закреп И органическая копия - алертам нужна органика."""
+    promo = mp.OfferRow(offer_id=555, position=1, position_organic=None,
+                        title="t", seller="s", reviews=None, price=9.0,
+                        currency="₽", promo=True, online=False, auto=False)
+    organic = mp.OfferRow(offer_id=555, position=25, position_organic=20,
+                          title="t", seller="s", reviews=None, price=9.0,
+                          currency="₽", promo=False, online=False, auto=False)
+    assert mp.find_offer([promo, organic], 555) is organic
+    assert mp.find_offer([promo], 555) is promo  # только закреп - возвращаем его
+
+
+def test_competitors_above_excludes_own_duplicate() -> None:
+    promo = mp.OfferRow(offer_id=555, position=1, position_organic=None,
+                        title="t", seller="s", reviews=None, price=9.0,
+                        currency="₽", promo=True, online=False, auto=False)
+    other = mp.OfferRow(offer_id=777, position=2, position_organic=1,
+                        title="t", seller="x", reviews=None, price=8.0,
+                        currency="₽", promo=False, online=False, auto=False)
+    mine = mp.OfferRow(offer_id=555, position=25, position_organic=20,
+                       title="t", seller="s", reviews=None, price=9.0,
+                       currency="₽", promo=False, online=False, auto=False)
+    above = mp.competitors_above([promo, other, mine], mine)
+    assert [c.offer_id for c in above] == [777]  # свой закреп - не конкурент
 
 
 def test_find_offer_missing_returns_none() -> None:
@@ -115,6 +144,47 @@ def test_dumping_detection() -> None:
     assert dumpers[0].offer_id == 70000001
     # у первого строки (закреп) конкурентов выше нет
     assert mp.cheaper_competitors_above(rows, rows[0]) == []
+
+
+def test_promo_end_alert(monkeypatch) -> None:
+    """Лот был в закрепе и выпал из него - алерт «Продвижение закончилось»."""
+    sent: list[str] = []
+    monkeypatch.setattr(mp, "_send_tg", lambda cardinal, text: sent.append(text))
+    mp._STATES.clear()
+
+    def row(promo: bool) -> mp.OfferRow:
+        return mp.OfferRow(offer_id=555, position=1 if promo else 25,
+                           position_organic=None if promo else 20, title="t",
+                           seller="s", reviews=None, price=9.0, currency="₽",
+                           promo=promo, online=False, auto=False)
+
+    lot = {"lot_id": 555, "node_id": 1392, "name": "Тест"}
+    mp._process_lot(object(), lot, [row(promo=True)], now=1000.0)    # замер в закрепе
+    assert sent == []                                                # вход в закреп не алертится
+    mp._process_lot(object(), lot, [row(promo=False)], now=1060.0)   # закреп кончился
+    assert any("Продвижение закончилось" in text for text in sent)
+
+
+def test_empty_listing_counts_as_failure(monkeypatch) -> None:
+    """Пустая выдача (смена вёрстки) - сбой запроса, а не «лоты пропали»."""
+    alerts: list[str] = []
+    processed: list[int] = []
+    monkeypatch.setattr(mp, "_configured_lots",
+                        lambda: [{"lot_id": 1, "node_id": 2, "name": "L"}])
+    monkeypatch.setattr(mp, "fetch_node_rows", lambda cardinal, node: ([], "html"))
+    monkeypatch.setattr(mp, "_send_tg", lambda cardinal, text: alerts.append(text))
+    monkeypatch.setattr(mp, "_process_lot",
+                        lambda cardinal, lot, rows, now: processed.append(lot["lot_id"]))
+
+    failures: dict[int, int] = {}
+    mp._run_check_cycle(object(), failures)
+    mp._run_check_cycle(object(), failures)
+    assert failures[2] == 2            # копится как сбой
+    assert alerts == [] and processed == []   # лоты НЕ помечаются пропавшими
+
+    mp._run_check_cycle(object(), failures)   # третья подряд - уведомление
+    assert failures[2] == 3
+    assert len(alerts) == 1 and "0 строк" in alerts[0]
 
 
 def test_lazyload_hidden_row_is_counted() -> None:

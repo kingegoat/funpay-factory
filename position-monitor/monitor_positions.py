@@ -39,7 +39,7 @@ except ImportError:
 # ============================================================================
 
 NAME: str = "Монитор позиций"
-VERSION: str = "1.0.0"
+VERSION: str = "1.1.0"
 DESCRIPTION: str = ("Следит за позициями лотов в выдаче FunPay: алерты о падении, "
                     "демпинге и исчезновении лота, утренняя сводка, команда /positions.")
 CREDITS: str = "funpay-factory"
@@ -116,6 +116,7 @@ class LotState:
     last_position: int | None = None
     last_organic: int | None = None
     last_price: float | None = None
+    last_promo: bool | None = None   # был ли лот в закрепе на прошлой проверке
     seen: bool = False               # был найден на предыдущей проверке
     ever_seen: bool = False          # находился хотя бы раз с момента запуска
     missing_announced: bool = False  # уже сообщили, что лота нет с момента запуска
@@ -224,16 +225,30 @@ def parse_lots_html(html_text: str, parser: str | None = None) -> list[OfferRow]
 
 
 def find_offer(rows: Sequence[OfferRow], lot_id: int) -> OfferRow | None:
-    """Ищет первую строку выдачи с указанным offer id (лоты в закрепе дублируются)."""
+    """Ищет строку выдачи с указанным offer id.
+
+    Лот с платным продвижением встречается в выдаче дважды: закреп сверху и
+    своя органическая строка ниже. Для алертов нужна именно органическая копия:
+    у закрепа позиция всегда топовая, из-за чего падение и демпинг не видны.
+    Если лот есть только в закрепе - возвращаем закреп (лучше, чем ничего).
+    """
+    promo_row: OfferRow | None = None
     for row in rows:
-        if row.offer_id == int(lot_id):
+        if row.offer_id != int(lot_id):
+            continue
+        if not row.promo:
             return row
-    return None
+        if promo_row is None:
+            promo_row = row
+    return promo_row
 
 
 def competitors_above(rows: Sequence[OfferRow], row: OfferRow) -> list[OfferRow]:
-    """Все строки выдачи, находящиеся выше указанной."""
-    return list(rows[:row.position - 1])
+    """Все строки выдачи, находящиеся выше указанной.
+
+    Собственный закреп-дубль лота (тот же offer id) не считается конкурентом.
+    """
+    return [r for r in rows[:row.position - 1] if r.offer_id != row.offer_id]
 
 
 def cheaper_competitors_above(rows: Sequence[OfferRow], row: OfferRow) -> list[OfferRow]:
@@ -553,6 +568,19 @@ def _process_lot(cardinal: Any, lot_cfg: dict[str, Any], rows: Sequence[OfferRow
             if state.first_position is None:
                 state.first_position = row.position
 
+            # (0) конец платного продвижения: лот был в закрепе и выпал из него.
+            # Это главный алерт для платящих: без закрепа поток покупателей
+            # резко падает, а обычный «drop» его часто глотает порогом.
+            if state.last_promo and not row.promo:
+                if cooldown_allowed(state, "promo_end", now, cooldown_sec):
+                    mark_alert(state, "promo_end", now)
+                    alerts.append(
+                        f"🏁 <b>Продвижение закончилось</b>\n"
+                        f"Лот «{esc(name)}» выпал из закрепа и вернулся в обычную выдачу: "
+                        f"{format_position_delta(state.last_position, row.position)}\n"
+                        f"Цена: {fmt_price(row.price, row.currency)}\n"
+                        f"Если продвижение окупалось - пора продлевать.")
+
             # (1) падение позиции
             if (state.last_position is not None
                     and row.position - state.last_position >= threshold
@@ -589,6 +617,7 @@ def _process_lot(cardinal: Any, lot_cfg: dict[str, Any], rows: Sequence[OfferRow
             state.last_position = row.position
             state.last_organic = row.position_organic
             state.last_price = row.price
+            state.last_promo = row.promo
 
     for text in alerts:
         _send_tg(cardinal, text)
@@ -633,7 +662,8 @@ def _maybe_morning_summary(cardinal: Any) -> None:
             delta = format_position_delta(baseline, state.last_position)
             organic = (f", без закрепа #{state.last_organic}"
                        if state.last_organic else "")
-            lines.append(f"• {esc(lot['name'])}: #{state.last_position}{organic} | "
+            pin = " (в закрепе)" if state.last_promo else ""
+            lines.append(f"• {esc(lot['name'])}: #{state.last_position}{organic}{pin} | "
                          f"за ночь: {delta}")
             state.summary_position = state.last_position
     _send_tg(cardinal, "\n".join(lines))
@@ -655,6 +685,13 @@ def _run_check_cycle(cardinal: Any, failures: dict[int, int]) -> None:
     for node_id, lots in by_node.items():
         try:
             rows, source = fetch_node_rows(cardinal, node_id)
+            if not rows:
+                # Пустая выдача - почти всегда сбой, а не «все лоты пропали»:
+                # сменилась вёрстка (парсер не нашёл ни одной строки) или раздел
+                # недоступен. Считаем это ошибкой запроса, а не пропажей лотов,
+                # иначе смена вёрстки даёт лавину ложных алертов «лот пропал».
+                raise RuntimeError(
+                    "выдача пуста (0 строк): сменилась вёрстка или раздел недоступен")
             failures[node_id] = 0
         except Exception as ex:  # pylint: disable=broad-except
             failures[node_id] = failures.get(node_id, 0) + 1
@@ -666,8 +703,9 @@ def _run_check_cycle(cardinal: Any, failures: dict[int, int]) -> None:
                 _send_tg(cardinal,
                          f"⚠️ <b>Монитор позиций</b>\n"
                          f"Не удалось получить выдачу раздела {node_id} "
-                         f"{count} раз подряд: {esc(ex.__class__.__name__)}. "
-                         f"Проверьте соединение и golden_key.")
+                         f"{count} раз подряд: {esc(str(ex) or ex.__class__.__name__)[:160]}. "
+                         f"Проверьте соединение и golden_key; если раздел открывается "
+                         f"в браузере - вероятно, FunPay сменил вёрстку, обновите плагин.")
             continue
 
         logger.info("Раздел %s: %d строк (источник: %s)", node_id, len(rows), source)
