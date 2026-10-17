@@ -93,9 +93,16 @@ def _make_server(handler_class) -> ThreadingHTTPServer:
 
 
 class _OkHandler(BaseHTTPRequestHandler):
-    """Всегда валидный OpenAI-совместимый ответ."""
+    """Всегда валидный OpenAI-совместимый ответ; запоминает тело запроса."""
+
+    last_body: dict = {}
 
     def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        try:
+            _OkHandler.last_body = json.loads(raw.decode("utf-8"))
+        except ValueError:  # pragma: no cover - мусор в тесте, а не в коде
+            _OkHandler.last_body = {}
         body = json.dumps({
             "id": "chatcmpl-test",
             "choices": [{
@@ -152,10 +159,15 @@ def _build_module(workdir: str):
     module._CONFIG_PATH = os.path.join(workdir, "config.json")
     module._PERSONA_PATH = os.path.join(workdir, "persona.txt")
     module._CONFIG_DIR = workdir
-    # Тесты детерминированы: воркеры выполняются синхронно.
+    # Тесты детерминированы: воркеры выполняются синхронно, ожидание кулдаунов отключено.
     module._spawn = lambda target: target()  # noqa: E731
+    module._interruptible_sleep = lambda seconds: None  # noqa: E731
     module._STATE_STOP.clear()
     module._COOLDOWNS.clear()
+    with module._PENDING_LOCK:
+        module._PENDING.clear()
+        module._PENDING_NAMES.clear()
+        module._INFLIGHT.clear()
     return module
 
 
@@ -281,16 +293,36 @@ def test_fallback_on_connection_error(plugin) -> None:
     assert cardinal.sent[0][1] == plugin._get_config()["fallback_text"]
 
 
-def test_cooldown_skips_second_message(plugin) -> None:
-    """Второе сообщение в том же чате в пределах кулдауна не обрабатывается."""
+def test_second_message_in_cooldown_not_dropped(plugin) -> None:
+    """Второе сообщение в кулдауне не выбрасывается: на него тоже приходит ответ."""
     server = _make_server(_OkHandler)
     try:
         _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
         cardinal = FakeCardinal()
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 1")))
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 2")))
-        assert len(cardinal.sent) == 1, "второй ответ в кулдауне не должен отправляться"
-        assert "Вопрос" not in cardinal.sent[0][1]
+        assert len(cardinal.sent) == 2, "второе сообщение не должно теряться"
+        assert "300 руб." in cardinal.sent[0][1]
+    finally:
+        server.shutdown()
+
+
+def test_messages_accumulated_inflight_answered_as_one(plugin) -> None:
+    """Пока воркер готовит ответ, новые сообщения копятся и уходят в ОДИН ответ."""
+    server = _make_server(_OkHandler)
+    try:
+        _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
+        plugin._spawn = lambda target: None  # воркер не запускаем - копим вручную
+        cardinal = FakeCardinal()
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 1")))
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 2")))
+        assert cardinal.sent == []
+        assert plugin._PENDING[2001] == ["Вопрос 1", "Вопрос 2"]
+
+        plugin._chat_task(cardinal, 2001)  # запускаем воркер вручную
+        assert len(cardinal.sent) == 1, "накопленное уходит одним ответом"
+        user_msg = _OkHandler.last_body["messages"][1]["content"]
+        assert "Вопрос 1" in user_msg and "Вопрос 2" in user_msg
     finally:
         server.shutdown()
 
@@ -309,17 +341,47 @@ def test_different_chats_not_blocked_by_cooldown(plugin) -> None:
         server.shutdown()
 
 
-def test_global_cooldown_limits_cross_chat_flood(plugin) -> None:
-    """Всплеск из разных чатов упирается в глобальный кулдаун LLM."""
+def test_global_cooldown_defers_instead_of_dropping(plugin) -> None:
+    """Всплеск из разных чатов выдерживает паузу между LLM-запросами, не теряя чатов."""
     server = _make_server(_OkHandler)
     try:
         cfg = _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
         cfg["global_cooldown"] = 3600
+        sleeps: list[float] = []
+        plugin._interruptible_sleep = lambda seconds: sleeps.append(seconds)
         cardinal = FakeCardinal()
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=1)))
-        # Сообщение из другого чата в ту же секунду - LLM-запрос не нужен.
         plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(chat_id=2)))
-        assert len(cardinal.sent) == 1
+        assert len(cardinal.sent) == 2, "глобальный кулдаун не выбрасывает чаты"
+        assert max(sleeps) >= 3599, "между запросами должна выдерживаться пауза"
+    finally:
+        server.shutdown()
+
+
+def test_send_failure_keeps_texts_and_skips_cooldown(plugin) -> None:
+    """Ошибка отправки не замораживает чат: тексты в очереди, кулдауна нет."""
+    server = _make_server(_OkHandler)
+    try:
+        _configured(plugin, f"http://127.0.0.1:{server.server_port}/v1")
+
+        class FlakyCardinal(FakeCardinal):
+            fail_first = True
+
+            def send_message(self, chat_id, text, chat_name=None, *args, **kwargs):
+                if FlakyCardinal.fail_first:
+                    FlakyCardinal.fail_first = False
+                    raise RuntimeError("chat unavailable")
+                super().send_message(chat_id, text, chat_name)
+
+        cardinal = FlakyCardinal()
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 1")))
+        assert cardinal.sent == [], "отправка упала - ответа нет"
+        assert plugin._PENDING[2001] == ["Вопрос 1"], "текст вернулся в очередь"
+        assert plugin._COOLDOWNS.remaining(2001, 60) == 0, "кулдаун не ставится"
+
+        plugin.new_message_handler(cardinal, FakeEvent(FakeMessage(text="Вопрос 2")))
+        assert len(cardinal.sent) == 1, "следующее сообщение повторяет попытку"
+        assert cardinal.sent[0][0] == 2001
     finally:
         server.shutdown()
 

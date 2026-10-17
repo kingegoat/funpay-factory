@@ -6,10 +6,17 @@
 (endpoint /chat/completions: OpenAI, OpenRouter, DeepSeek, локальный шлюз и т.д.).
 
 Как работает:
-    * BIND_TO_NEW_MESSAGE: если автор сообщения - не владелец аккаунта,
-      чат не в кулдауне и автоответчик включён - собрать промпт
-      (persona + FAQ/прайс из CONFIG + текст сообщения покупателя),
-      запросить ответ у LLM и отправить его через cardinal.send_message().
+    * BIND_TO_NEW_MESSAGE: если автор сообщения - не владелец аккаунта
+      и автоответчик включён - сообщение ПОСТАВИТЬСЯ В ОЧЕРЕДЬ чата
+      (ничего не выбрасывается). Фоновый воркер чата ждёт конца кулдауна,
+      берёт все накопленные сообщения разом, запрашивает ответ у LLM
+      (persona + FAQ/прайс из CONFIG + тексты покупателя) и отправляет
+      одним сообщением через cardinal.send_message().
+    * Кулдаун чата фиксируется только после УСПЕШНОЙ отправки: если LLM
+      или отправка упали - покупатель не замораживается, следующее его
+      сообщение повторит попытку (тексты вернутся в очередь).
+    * Глобальный кулдаун - это пауза между LLM-запросами разных чатов,
+      а не отбрасывание чужих сообщений (анти-флуд без потерь).
     * Любая ошибка API - отправка статичного fallback-текста + логирование.
     * Команды Telegram: /ar_on, /ar_off, /ar_test.
 
@@ -46,7 +53,7 @@ except Exception:  # старые версии Cardinal / запуск вне Ca
 # ============================== ОБЯЗАТЕЛЬНЫЕ АТРИБУТЫ ПЛАГИНА ==============================
 
 NAME: str = "ИИ-автоответчик"
-VERSION: str = "1.0.0"
+VERSION: str = "1.1.0"
 DESCRIPTION: str = (
     "Автоответчик на сообщения покупателей через любой OpenAI-совместимый API "
     "(OpenAI, OpenRouter, DeepSeek, локальный шлюз). Настройка - в файле "
@@ -114,24 +121,28 @@ logger = logging.getLogger("FPC.plugins.ai_responder")
 
 
 class _CooldownMap:
-    """Потокобезопасная карта кулдаунов «чат -> время последнего ответа»."""
+    """Потокобезопасная карта «чат -> время последнего УСПЕШНОГО ответа»."""
 
     def __init__(self, max_entries: int = _MAX_COOLDOWN_ENTRIES) -> None:
         self._lock = threading.Lock()
         self._map: dict[Any, float] = {}
         self._max_entries = max_entries
 
-    def check_and_set(self, key: Any, cooldown_seconds: float) -> bool:
-        """Возвращает True, если ключ не в кулдауне, и фиксирует время проверки."""
+    def remaining(self, key: Any, cooldown_seconds: float) -> float:
+        """Сколько секунд ещё действует кулдаун ключа (0 - не действует)."""
         now = time.time()
         with self._lock:
             last = self._map.get(key)
-            if last is not None and (now - last) < cooldown_seconds:
-                return False
-            self._map[key] = now
+            if last is None:
+                return 0.0
+            return max(0.0, cooldown_seconds - (now - last))
+
+    def mark(self, key: Any) -> None:
+        """Фиксирует «сейчас» как время последнего ответа (после успешной отправки)."""
+        with self._lock:
+            self._map[key] = time.time()
             if len(self._map) > self._max_entries:
                 self._prune_locked()
-            return True
 
     def clear(self) -> None:
         with self._lock:
@@ -147,6 +158,40 @@ _STATE_STOP = threading.Event()
 _COOLDOWNS = _CooldownMap()
 _CONFIG_LOCK = threading.RLock()
 _CONFIG_CACHE: Optional[dict[str, Any]] = None
+
+# Очередь ответов: сообщение покупателя не выбрасывается, а накапливается по чату.
+# Пока по чату идёт ответ (inflight) или действует кулдаун, новые сообщения ждут
+# в _PENDING и попадают в следующий ответ. Глобальный кулдаун не «выбрасывает»
+# чужие чаты, а выдерживает паузу между LLM-запросами.
+_PENDING_LOCK = threading.Lock()
+_PENDING: dict[Any, list[str]] = {}            # chat_id -> накопленные тексты
+_PENDING_NAMES: dict[Any, Optional[str]] = {}  # chat_id -> имя чата для send_message
+_INFLIGHT: set[Any] = set()                    # чаты, по которым работает воркер
+_MAX_PENDING_PER_CHAT: int = 5                 # память: держим последние N сообщений
+
+# Глобальный rate-limit LLM: момент последнего запроса + лок брони слота.
+_GATE_LOCK = threading.Lock()
+_LAST_LLM_AT: float = 0.0
+
+
+def _interruptible_sleep(seconds: float) -> None:
+    """Сон до `seconds` или до остановки плагина (возвращает управление рано)."""
+    if seconds > 0:
+        _STATE_STOP.wait(seconds)
+
+
+def _acquire_llm_slot(global_cooldown: float) -> None:
+    """Бронирует следующий свободный слот LLM-запроса и ждёт его наступления.
+
+    Бронь под локом (два потока не займут один слот), ожидание - вне лока
+    (сон не блокирует другим чатам возможность бронировать следующие слоты).
+    """
+    global _LAST_LLM_AT
+    with _GATE_LOCK:
+        now = time.time()
+        wait = max(0.0, _LAST_LLM_AT + global_cooldown - now)
+        _LAST_LLM_AT = now + wait  # слот занят нами, следующий - не раньше чем через паузу
+    _interruptible_sleep(wait)
 
 
 def _spawn(target: Callable[[], None]) -> None:
@@ -430,63 +475,131 @@ def new_message_handler(cardinal: Any, event: Any) -> None:
     if chat_id is None:
         return
 
-    try:
-        cooldown = float(cfg.get("cooldown", 60))
-    except (TypeError, ValueError):
-        cooldown = 60.0
-    if cooldown < 0:
-        cooldown = 0.0
-
-    if not _COOLDOWNS.check_and_set(chat_id, cooldown):
-        logger.debug("Чат %s в кулдауне (%.0f c) - пропускаю", chat_id, cooldown)
-        return
-    # Глобальный кулдаун: флуд из множества свежих чатов не должен превращаться
-    # в неограниченный счёт за LLM-запросы на ключе продавца (0 - отключить).
-    try:
-        global_cd = float(cfg.get("global_cooldown", 5))
-    except (TypeError, ValueError):
-        global_cd = 5.0
-    if global_cd > 0 and not _COOLDOWNS.check_and_set("__global__", global_cd):
-        logger.debug("Глобальный кулдаун LLM - запрос из чата %s пропущен", chat_id)
-        return
     # Стоимость запроса растёт с длиной; покупателю хватит и 2000 символов.
     buyer_text = buyer_text[:2000]
-
     chat_name = getattr(message, "chat_name", None)
+
+    # Сообщения НЕ выбрасываем: копим по чату и ответим одним ответом.
+    # Кулдаун проверяет воркер перед ответом, а не вход (см. _chat_task).
+    with _PENDING_LOCK:
+        texts = _PENDING.setdefault(chat_id, [])
+        texts.append(buyer_text)
+        if len(texts) > _MAX_PENDING_PER_CHAT:
+            del texts[:-_MAX_PENDING_PER_CHAT]
+        _PENDING_NAMES[chat_id] = chat_name
+        kick = chat_id not in _INFLIGHT
+        if kick:
+            _INFLIGHT.add(chat_id)
+
     logger.info(
-        "ИИ-автоответчик: сообщение от покупателя в чате %s (%s), запрашиваю ответ LLM",
+        "ИИ-автоответчик: сообщение от покупателя в чате %s (%s)%s",
         chat_name or chat_id, chat_id,
+        "" if kick else " - добавлено в очередь к готовящемуся ответу",
     )
-    _spawn(lambda: _reply_worker(cardinal, chat_id, chat_name, buyer_text))
+    if kick:
+        _spawn(lambda: _chat_task(cardinal, chat_id))
 
 
-def _reply_worker(cardinal: Any, chat_id: Any, chat_name: Optional[str], buyer_text: str) -> None:
-    """Фоновый поток: LLM-запрос и отправка ответа (или fallback)."""
-    if _STATE_STOP.is_set():
-        return
-    cfg = _get_config()
-    system_prompt = _build_system_prompt(cfg)
+def _chat_task(cardinal: Any, chat_id: Any) -> None:
+    """Фоновый поток: отвечает на все накопленные сообщения чата.
 
-    answer: Optional[str] = None
+    Цикл: дождаться конца кулдауна чата -> взять все накопленные сообщения ->
+    забронировать слот LLM (глобальный rate-limit) -> запрос -> отправка.
+    Кулдаун чата ставится ТОЛЬКО после успешной отправки: если LLM или отправка
+    упали, покупатель не замораживается - следующее его сообщение запустит
+    попытку заново (текущие тексты вернутся в очередь).
+    """
     try:
-        answer = _llm_request(cfg, system_prompt, buyer_text)
-    except Exception as exc:  # на всякий случай: _llm_request не должен бросать
-        logger.error("Неожиданная ошибка LLM-запроса: %s", exc)
-    if answer is None:
-        answer = str(cfg.get("fallback_text") or DEFAULT_FALLBACK_TEXT).strip()
-        logger.warning("ИИ-автоответчик: LLM недоступен, отправлен fallback-текст в чат %s", chat_id)
-    # Чат FunPay не резиновый, а инъекция может вытащить простыню: режем.
-    answer = answer[:600].rstrip()
-    try:
-        cardinal.send_message(chat_id, answer, chat_name)
-        logger.info("ИИ-автоответчик: ответ отправлен в чат %s", chat_id)
-    except Exception as exc:
-        logger.error("ИИ-автоответчик: не удалось отправить сообщение в чат %s: %s", chat_id, exc)
+        while not _STATE_STOP.is_set():
+            cfg = _get_config()
+            if not bool(cfg.get("enabled", False)):
+                _drop_chat(chat_id)
+                return
+
+            cooldown = max(_as_float(cfg.get("cooldown", 60), 60.0), 0.0)
+
+            # Сначала забираем накопленное; если пусто - выходим, поток не паркуется.
+            with _PENDING_LOCK:
+                texts = _PENDING.pop(chat_id, [])
+                chat_name = _PENDING_NAMES.pop(chat_id, None)
+                if not texts:
+                    _INFLIGHT.discard(chat_id)
+                    return  # спокойный выход: новое сообщение запустит новый воркер
+
+            # Есть что отвечать - ждём конца кулдауна чата (inflight держит
+            # монополию, новые сообщения докладываются в _PENDING мимо нас).
+            _interruptible_sleep(_COOLDOWNS.remaining(chat_id, cooldown))
+            if _STATE_STOP.is_set():
+                _restore_texts(chat_id, texts, chat_name)
+                return
+
+            # За время ожидания могли прийти новые сообщения - берём и их.
+            with _PENDING_LOCK:
+                extra = _PENDING.pop(chat_id, [])
+                if extra:
+                    texts += extra
+                    chat_name = _PENDING_NAMES.pop(chat_id, chat_name)
+
+            # Несколько сообщений покупателя уходят одним ответом.
+            buyer_text = "\n\n".join(texts)[:4000]
+            system_prompt = _build_system_prompt(cfg)
+
+            global_cd = max(_as_float(cfg.get("global_cooldown", 5), 5.0), 0.0)
+            _acquire_llm_slot(global_cd)
+            if _STATE_STOP.is_set():
+                _restore_texts(chat_id, texts, chat_name)
+                return
+
+            answer: Optional[str] = None
+            try:
+                answer = _llm_request(cfg, system_prompt, buyer_text)
+            except Exception as exc:  # на всякий случай: _llm_request не должен бросать
+                logger.error("Неожиданная ошибка LLM-запроса: %s", exc)
+            if answer is None:
+                answer = str(cfg.get("fallback_text") or DEFAULT_FALLBACK_TEXT).strip()
+                logger.warning("ИИ-автоответчик: LLM недоступен, отправлен fallback-текст в чат %s", chat_id)
+            # Чат FunPay не резиновый, а инъекция может вытащить простыню: режем.
+            answer = answer[:600].rstrip()
+            try:
+                cardinal.send_message(chat_id, answer, chat_name)
+                logger.info("ИИ-автоответчик: ответ отправлен в чат %s", chat_id)
+            except Exception as exc:
+                logger.error("ИИ-автоответчик: не удалось отправить сообщение в чат %s: %s", chat_id, exc)
+                _restore_texts(chat_id, texts, chat_name)
+                return  # без кулдауна: следующее сообщение покупателя повторит попытку
+
+            _COOLDOWNS.mark(chat_id)
+            # пока готовили ответ, могли прийти новые сообщения - цикл продолжится
+    finally:
+        with _PENDING_LOCK:
+            _INFLIGHT.discard(chat_id)
+
+
+def _drop_chat(chat_id: Any) -> None:
+    """Чистит очередь чата и снимает inflight (выключение плагина)."""
+    with _PENDING_LOCK:
+        _PENDING.pop(chat_id, None)
+        _PENDING_NAMES.pop(chat_id, None)
+        _INFLIGHT.discard(chat_id)
+
+
+def _restore_texts(chat_id: Any, texts: list[str], chat_name: Optional[str]) -> None:
+    """Возвращает тексты в очередь (отправка не удалась) и снимает inflight."""
+    with _PENDING_LOCK:
+        merged = texts + _PENDING.get(chat_id, [])
+        if merged:
+            _PENDING[chat_id] = merged[-_MAX_PENDING_PER_CHAT:]
+            _PENDING_NAMES[chat_id] = chat_name
+        _INFLIGHT.discard(chat_id)
 
 
 def init_plugin(cardinal: Any, *args: Any) -> None:
     """BIND_TO_PRE_INIT: грузит конфиг, создаёт файлы, регистрирует TG-команды."""
     _STATE_STOP.clear()  # на случай повторной инициализации без рестарта процесса
+    with _PENDING_LOCK:  # и хвосты прошлой сессии не должны застрять в очереди
+        _PENDING.clear()
+        _PENDING_NAMES.clear()
+        _INFLIGHT.clear()
     _load_config()
     _ensure_persona_file()
     _register_telegram_commands(cardinal)
@@ -500,6 +613,13 @@ def init_plugin(cardinal: Any, *args: Any) -> None:
 def stop_plugin(cardinal: Any, *args: Any) -> None:
     """BIND_TO_PRE_STOP: чистая остановка фоновых потоков."""
     _STATE_STOP.set()
+    with _PENDING_LOCK:
+        _PENDING.clear()
+        _PENDING_NAMES.clear()
+        _INFLIGHT.clear()
+    global _LAST_LLM_AT
+    with _GATE_LOCK:
+        _LAST_LLM_AT = 0.0
     _COOLDOWNS.clear()
     logger.info("Плагин «%s» остановлен", NAME)
 
